@@ -5,209 +5,386 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	domainApp "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/app"
+	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/websocket"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/validations"
-	fiberUtils "github.com/gofiber/fiber/v2/utils"
+	fiberUtils "github.com/gofiber/utils/v2"
 	"github.com/sirupsen/logrus"
 	"github.com/skip2/go-qrcode"
 	"go.mau.fi/libsignal/logger"
 	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 )
 
 type serviceApp struct {
-	WaCli *whatsmeow.Client
-	db    *sqlstore.Container
+	chatStorageRepo domainChatStorage.IChatStorageRepository
+	deviceManager   *whatsapp.DeviceManager
 }
 
-func NewAppService(waCli *whatsmeow.Client, db *sqlstore.Container) domainApp.IAppUsecase {
+func NewAppService(chatStorageRepo domainChatStorage.IChatStorageRepository, deviceManager *whatsapp.DeviceManager) domainApp.IAppUsecase {
 	return &serviceApp{
-		WaCli: waCli,
-		db:    db,
+		chatStorageRepo: chatStorageRepo,
+		deviceManager:   deviceManager,
 	}
 }
 
-func (service serviceApp) Login(_ context.Context) (response domainApp.LoginResponse, err error) {
-	if service.WaCli == nil {
-		return response, pkgError.ErrWaCLI
+func (service *serviceApp) Login(ctx context.Context, deviceID string) (response domainApp.LoginResponse, err error) {
+	instance, client, err := service.ensureClient(ctx, deviceID)
+	if err != nil {
+		return response, err
 	}
 
-	// Disconnect for reconnecting
-	service.WaCli.Disconnect()
+	if client.IsLoggedIn() {
+		instance.UpdateStateFromClient()
+		return response, pkgError.ErrAlreadyLoggedIn
+	}
 
-	chImage := make(chan string)
+	// Disconnect first to ensure QR flow starts cleanly.
+	client.Disconnect()
+	instance.ClearPasskeyState()
 
-	ch, err := service.WaCli.GetQRChannel(context.Background())
+	// Use a detached context for the QR channel so the pairing session
+	// survives after the HTTP response is sent. The HTTP request context
+	// has a short timeout (e.g. 45s) which would cancel the QR emitter
+	// and disconnect the client before the user can scan the code.
+	// Total QR window: ~160s (first code 60s + five codes at 20s each).
+	qrCtx, qrCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+
+	chImage := make(chan string, 1) // Buffered to prevent goroutine leak
+	ch, err := client.GetQRChannel(qrCtx)
 	if err != nil {
-		logrus.Error(err.Error())
-		// This error means that we're already logged in, so ignore it.
+		qrCancel()
+		logrus.Errorf("[LOGIN][%s] GetQRChannel failed: %v", deviceID, err)
 		if errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
-			_ = service.WaCli.Connect() // just connect to websocket
-			if service.WaCli.IsLoggedIn() {
+			_ = client.Connect()
+			instance.UpdateStateFromClient()
+			if client.IsLoggedIn() {
 				return response, pkgError.ErrAlreadyLoggedIn
 			}
 			return response, pkgError.ErrSessionSaved
-		} else {
-			return response, pkgError.ErrQrChannel
 		}
-	} else {
-		go func() {
-			for evt := range ch {
-				response.Code = evt.Code
-				response.Duration = evt.Timeout / time.Second / 2
-				if evt.Event == "code" {
-					qrPath := fmt.Sprintf("%s/scan-qr-%s.png", config.PathQrCode, fiberUtils.UUIDv4())
-					err = qrcode.WriteFile(evt.Code, qrcode.Medium, 512, qrPath)
-					if err != nil {
-						logrus.Error("Error when write qr code to file: ", err)
-					}
-					go func() {
-						time.Sleep(response.Duration * time.Second)
-						err := os.Remove(qrPath)
-						if err != nil {
-							logrus.Error("error when remove qrImage file", err.Error())
-						}
-					}()
-					chImage <- qrPath
-				} else {
-					logrus.Error("error when get qrCode", evt.Event)
-				}
-			}
-		}()
+		return response, pkgError.ErrQrChannel
 	}
 
-	err = service.WaCli.Connect()
-	if err != nil {
+	go func() {
+		defer qrCancel()
+		defer close(chImage) // Ensure channel is closed when done
+		for evt := range ch {
+			response.Code = evt.Code
+			response.Duration = evt.Timeout / time.Second / 2
+			if evt.Event == "code" {
+				qrPath := fmt.Sprintf("%s/scan-qr-%s.png", config.PathQrCode, fiberUtils.UUIDv4())
+				if err := qrcode.WriteFile(evt.Code, qrcode.Medium, 512, qrPath); err != nil {
+					logrus.Errorf("[LOGIN][%s] Error when write qr code to file: %v", deviceID, err)
+					continue // Skip sending if QR generation failed
+				}
+				go func(path string, duration time.Duration) {
+					time.Sleep(duration * time.Second)
+					if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+						logrus.Errorf("[LOGIN][%s] error when remove qrImage file: %v", deviceID, err)
+					}
+				}(qrPath, response.Duration)
+				select {
+				case chImage <- qrPath:
+				case <-qrCtx.Done():
+					logrus.Warnf("[LOGIN][%s] QR context canceled while sending QR path", deviceID)
+					return
+				}
+			} else if evt.Event == whatsmeow.QRChannelEventPasskeyRequest || evt.Event == whatsmeow.QRChannelEventPasskeyResponse {
+				// Passkey events are broadcast by the global event handler and served via /app/passkey endpoints.
+				logrus.Infof("[LOGIN][%s] passkey pairing event: %s", deviceID, evt.Event)
+			} else {
+				logrus.Errorf("[LOGIN][%s] error when get qrCode %s %v", deviceID, evt.Event, evt.Error)
+			}
+		}
+	}()
+
+	if err = client.Connect(); err != nil {
+		qrCancel()
 		logger.Error("Error when connect to whatsapp", err)
 		return response, pkgError.ErrReconnect
 	}
-	response.ImagePath = <-chImage
+
+	instance.UpdateStateFromClient()
+
+	// Wait for QR image with timeout to prevent hanging
+	select {
+	case imagePath, ok := <-chImage:
+		if !ok {
+			return response, fmt.Errorf("QR channel closed without receiving image")
+		}
+		response.ImagePath = imagePath
+	case <-ctx.Done():
+		return response, ctx.Err()
+	case <-time.After(120 * time.Second):
+		return response, fmt.Errorf("timeout waiting for QR code")
+	}
 
 	return response, nil
 }
 
-func (service serviceApp) LoginWithCode(ctx context.Context, phoneNumber string) (loginCode string, err error) {
+func (service *serviceApp) LoginWithCode(ctx context.Context, deviceID string, phoneNumber string) (loginCode string, err error) {
 	if err = validations.ValidateLoginWithCode(ctx, phoneNumber); err != nil {
 		logrus.Errorf("Error when validate login with code: %s", err.Error())
 		return loginCode, err
 	}
 
-	// detect is already logged in
-	if service.WaCli.Store.ID != nil {
-		logrus.Warn("User is already logged in")
+	instance, client, err := service.ensureClient(ctx, deviceID)
+	if err != nil {
+		return loginCode, err
+	}
+
+	if client.IsLoggedIn() {
+		instance.UpdateStateFromClient()
 		return loginCode, pkgError.ErrAlreadyLoggedIn
 	}
 
-	// reconnect first
-	_ = service.Reconnect(ctx)
+	// Connect before requesting pairing code.
+	if !client.IsConnected() {
+		if err = client.Connect(); err != nil {
+			return loginCode, err
+		}
+	}
 
-	loginCode, err = service.WaCli.PairPhone(ctx, phoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	logrus.Infof("[LOGIN_CODE][%s] Starting phone pairing for number: %s", deviceID, phoneNumber)
+	loginCode, err = client.PairPhone(ctx, phoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
 		logrus.Errorf("Error when pairing phone: %s", err.Error())
 		return loginCode, err
 	}
 
+	instance.UpdateStateFromClient()
 	logrus.Infof("Successfully paired phone with code: %s", loginCode)
 	return loginCode, nil
 }
 
-func (service serviceApp) Logout(ctx context.Context) (err error) {
-	// delete history
-	files, err := filepath.Glob(fmt.Sprintf("./%s/history-*", config.PathStorages))
-	if err != nil {
-		return err
+func (service *serviceApp) PasskeyChallenge(_ context.Context, deviceID string) (response domainApp.PasskeyChallengeResponse, err error) {
+	if service.deviceManager == nil {
+		return response, fmt.Errorf("device manager not initialized")
 	}
 
-	for _, f := range files {
-		err = os.Remove(f)
-		if err != nil {
-			return err
-		}
-	}
-	// delete qr images
-	qrImages, err := filepath.Glob(fmt.Sprintf("./%s/scan-*", config.PathQrCode))
-	if err != nil {
-		return err
+	instance, ok := service.deviceManager.GetDevice(deviceID)
+	if !ok || instance == nil {
+		return response, fmt.Errorf("device %s not found", deviceID)
 	}
 
-	for _, f := range qrImages {
-		err = os.Remove(f)
-		if err != nil {
-			return err
-		}
+	challenge, code, skipHandoffUX := instance.PasskeyState()
+	response.Status = "none"
+	if challenge != nil {
+		response.Status = "awaiting_response"
+	} else if code != "" {
+		response.Status = "awaiting_confirmation"
 	}
-
-	// delete senditems
-	qrItems, err := filepath.Glob(fmt.Sprintf("./%s/*", config.PathSendItems))
-	if err != nil {
-		return err
-	}
-
-	for _, f := range qrItems {
-		if !strings.Contains(f, ".gitignore") {
-			err = os.Remove(f)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	err = service.WaCli.Logout(ctx)
-	return
+	response.Challenge = challenge
+	response.Code = code
+	response.SkipHandoffUX = skipHandoffUX
+	return response, nil
 }
 
-func (service serviceApp) Reconnect(_ context.Context) (err error) {
-	service.WaCli.Disconnect()
-	return service.WaCli.Connect()
-}
-
-func (service serviceApp) FirstDevice(ctx context.Context) (response domainApp.DevicesResponse, err error) {
-	if service.WaCli == nil {
-		return response, pkgError.ErrWaCLI
+func (service *serviceApp) PasskeyResponse(ctx context.Context, deviceID string, assertion *types.WebAuthnResponse) error {
+	if err := validations.ValidatePasskeyResponse(ctx, assertion); err != nil {
+		return err
 	}
 
-	devices, err := service.db.GetFirstDevice(ctx)
+	if service.deviceManager == nil {
+		return fmt.Errorf("device manager not initialized")
+	}
+
+	instance, ok := service.deviceManager.GetDevice(deviceID)
+	if !ok || instance == nil {
+		return fmt.Errorf("device %s not found", deviceID)
+	}
+
+	client := instance.GetClient()
+	if client == nil {
+		return pkgError.ErrWaCLI
+	}
+
+	challenge, _, _ := instance.PasskeyState()
+	if challenge == nil {
+		return fmt.Errorf("no pending passkey pairing request for device %s", deviceID)
+	}
+
+	if !client.IsConnected() {
+		return fmt.Errorf("device %s is not connected, restart login and retry the passkey flow", deviceID)
+	}
+
+	if err := client.SendPasskeyResponse(ctx, assertion); err != nil {
+		logrus.Errorf("[PASSKEY][%s] failed to send passkey response: %v", deviceID, err)
+		return err
+	}
+
+	// The PairPasskeyConfirmation event repopulates the confirmation code shortly after.
+	instance.ClearPasskeyState()
+	return nil
+}
+
+func (service *serviceApp) PasskeyConfirm(ctx context.Context, deviceID string) error {
+	if service.deviceManager == nil {
+		return fmt.Errorf("device manager not initialized")
+	}
+
+	instance, ok := service.deviceManager.GetDevice(deviceID)
+	if !ok || instance == nil {
+		return fmt.Errorf("device %s not found", deviceID)
+	}
+
+	client := instance.GetClient()
+	if client == nil {
+		return pkgError.ErrWaCLI
+	}
+
+	_, code, _ := instance.PasskeyState()
+	if code == "" {
+		return fmt.Errorf("no pending passkey confirmation for device %s", deviceID)
+	}
+
+	if !client.IsConnected() {
+		return fmt.Errorf("device %s is not connected, restart login and retry the passkey flow", deviceID)
+	}
+
+	if err := client.SendPasskeyConfirmation(ctx); err != nil {
+		logrus.Errorf("[PASSKEY][%s] failed to send passkey confirmation: %v", deviceID, err)
+		return err
+	}
+
+	instance.ClearPasskeyState()
+	return nil
+}
+
+func (service *serviceApp) Logout(ctx context.Context, deviceID string) error {
+	if err := validations.ValidateDeviceID(ctx, deviceID); err != nil {
+		return err
+	}
+	if service.deviceManager == nil {
+		return fmt.Errorf("device manager not initialized")
+	}
+
+	if err := service.deviceManager.LogoutDeviceKeepSlot(ctx, deviceID); err != nil {
+		logrus.WithError(err).Warnf("[LOGOUT][%s] logout completed with warnings", deviceID)
+		return err
+	}
+
+	// Broadcast the logout so the UI can refresh without manual polling. The slot is
+	// kept, so the device stays listed (disconnected) and can be re-paired by id.
+	var devices []domainApp.DevicesResponse
+	if list, err := service.FetchDevices(ctx); err == nil {
+		devices = list
+	} else {
+		logrus.WithError(err).Warn("[LOGOUT] failed to fetch devices after logout")
+	}
+
+	websocket.Broadcast <- websocket.BroadcastMessage{
+		Code:    "DEVICE_LOGGED_OUT",
+		Message: fmt.Sprintf("Device %s logged out (slot kept)", deviceID),
+		Result: map[string]any{
+			"device_id": deviceID,
+			"devices":   devices,
+		},
+	}
+
+	return nil
+}
+
+func (service *serviceApp) Reconnect(_ context.Context, deviceID string) (err error) {
+	instance, client, err := service.ensureClient(context.Background(), deviceID)
+	if err != nil {
+		return err
+	}
+
+	if client.Store == nil || client.Store.ID == nil {
+		return fmt.Errorf("device %s is not logged in (session deleted)", deviceID)
+	}
+
+	client.Disconnect()
+	err = client.Connect()
+	instance.UpdateStateFromClient()
+	if err != nil {
+		logrus.Errorf("[RECONNECT][%s] Reconnect failed: %v", deviceID, err)
+	}
+	return err
+}
+
+func (service *serviceApp) Status(_ context.Context, deviceID string) (bool, bool, error) {
+	if service.deviceManager == nil {
+		return false, false, fmt.Errorf("device manager not initialized")
+	}
+
+	instance, ok := service.deviceManager.GetDevice(deviceID)
+	if !ok || instance == nil {
+		return false, false, fmt.Errorf("device %s not found", deviceID)
+	}
+
+	instance.UpdateStateFromClient()
+	client := instance.GetClient()
+	if client == nil {
+		return false, false, nil
+	}
+
+	if client.Store == nil || client.Store.ID == nil {
+		return false, false, nil
+	}
+
+	return client.IsConnected(), client.IsLoggedIn(), nil
+}
+
+func (service *serviceApp) FirstDevice(ctx context.Context) (response domainApp.DevicesResponse, err error) {
+	devices, err := service.FetchDevices(ctx)
 	if err != nil {
 		return response, err
 	}
+	if len(devices) == 0 {
+		return response, fmt.Errorf("no devices available")
+	}
+	return devices[0], nil
+}
 
-	response.Device = devices.ID.String()
-	if devices.PushName != "" {
-		response.Name = devices.PushName
-	} else {
-		response.Name = devices.BusinessName
+func (service *serviceApp) FetchDevices(_ context.Context) (response []domainApp.DevicesResponse, err error) {
+	if service.deviceManager == nil {
+		return response, fmt.Errorf("device manager not initialized")
+	}
+
+	for _, inst := range service.deviceManager.ListDevices() {
+		inst.UpdateStateFromClient()
+		name := inst.DisplayName()
+		if name == "" {
+			name = inst.PhoneNumber()
+		}
+
+		response = append(response, domainApp.DevicesResponse{
+			Name:   name,
+			Device: inst.ID(),
+			JID:    inst.JID(),
+		})
 	}
 
 	return response, nil
 }
 
-func (service serviceApp) FetchDevices(ctx context.Context) (response []domainApp.DevicesResponse, err error) {
-	if service.WaCli == nil {
-		return response, pkgError.ErrWaCLI
+func (service *serviceApp) ensureClient(ctx context.Context, deviceID string) (*whatsapp.DeviceInstance, *whatsmeow.Client, error) {
+	if deviceID == "" {
+		return nil, nil, fmt.Errorf("device id is required")
 	}
 
-	devices, err := service.db.GetAllDevices(ctx)
+	if service.deviceManager == nil {
+		return nil, nil, fmt.Errorf("device manager not initialized")
+	}
+
+	instance, err := service.deviceManager.EnsureClient(ctx, deviceID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	for _, device := range devices {
-		var d domainApp.DevicesResponse
-		d.Device = device.ID.String()
-		if device.PushName != "" {
-			d.Name = device.PushName
-		} else {
-			d.Name = device.BusinessName
-		}
-
-		response = append(response, d)
+	client := instance.GetClient()
+	if client == nil {
+		return instance, nil, pkgError.ErrWaCLI
 	}
 
-	return response, nil
+	return instance, client, nil
 }

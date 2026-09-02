@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"image"
-	_ "image/gif"  // Register GIF format
-	_ "image/jpeg" // For JPEG encoding
-	_ "image/png"  // For PNG encoding
+	"image/color"
+	stddraw "image/draw"
+	_ "image/gif" // Register GIF format
+	"image/jpeg"
+	_ "image/png" // For PNG encoding
 	"io"
+	"math"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +23,7 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
+	"github.com/disintegration/imaging"
 	"github.com/sirupsen/logrus"
 	_ "golang.org/x/image/webp" // Register WebP format
 )
@@ -76,8 +81,92 @@ type Metadata struct {
 	Description string
 	Image       string
 	ImageThumb  []byte
+	JPEGThumb   []byte
 	Height      *uint32
 	Width       *uint32
+}
+
+const (
+	linkPreviewMaxImageDimension = 1024
+	linkPreviewMaxJPEGDimension  = 400
+	linkPreviewImageQuality      = 85
+	linkPreviewJPEGQuality       = 80
+)
+
+func resizeWithinBounds(src image.Image, maxDimension int) image.Image {
+	bounds := src.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+	if width <= maxDimension && height <= maxDimension {
+		return src
+	}
+	if width >= height {
+		return imaging.Resize(src, maxDimension, 0, imaging.Lanczos)
+	}
+	return imaging.Resize(src, 0, maxDimension, imaging.Lanczos)
+}
+
+func encodeJPEGWithBackground(src image.Image, quality int) ([]byte, error) {
+	bounds := src.Bounds()
+	canvas := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	stddraw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.White}, image.Point{}, stddraw.Src)
+	stddraw.Draw(canvas, canvas.Bounds(), src, bounds.Min, stddraw.Over)
+
+	var buffer bytes.Buffer
+	if err := jpeg.Encode(&buffer, canvas, &jpeg.Options{Quality: quality}); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
+func buildLinkPreviewThumbnails(src image.Image) (imageThumb []byte, jpegThumb []byte, width uint32, height uint32, err error) {
+	preview := resizeWithinBounds(src, linkPreviewMaxImageDimension)
+	previewBounds := preview.Bounds()
+	width = uint32(previewBounds.Dx())
+	height = uint32(previewBounds.Dy())
+
+	imageThumb, err = encodeJPEGWithBackground(preview, linkPreviewImageQuality)
+	if err != nil {
+		return nil, nil, 0, 0, err
+	}
+
+	inlinePreview := resizeWithinBounds(src, linkPreviewMaxJPEGDimension)
+	jpegThumb, err = encodeJPEGWithBackground(inlinePreview, linkPreviewJPEGQuality)
+	if err != nil {
+		return nil, nil, 0, 0, err
+	}
+
+	return imageThumb, jpegThumb, width, height, nil
+}
+
+// newBrowserRequest creates an HTTP request with browser-like headers
+// to avoid being blocked by anti-scraping protections during metadata extraction.
+func newBrowserRequest(method, reqURL string) (*http.Request, error) {
+	req, err := http.NewRequest(method, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Referer", reqURL)
+	req.Header.Set("Connection", "keep-alive")
+	return req, nil
+}
+
+// isRetryableStatus returns true for HTTP status codes where a retry may succeed.
+func isRetryableStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusForbidden,
+		http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
 }
 
 func GetMetaDataFromURL(urlStr string) (meta Metadata, err error) {
@@ -98,10 +187,27 @@ func GetMetaDataFromURL(urlStr string) (meta Metadata, err error) {
 		return meta, fmt.Errorf("invalid URL: %v", err)
 	}
 
-	// Send an HTTP GET request to the website
-	response, err := client.Get(urlStr)
-	if err != nil {
-		return meta, err
+	// Send an HTTP GET request with browser-like headers and retry on transient blocks
+	const maxRetries = 3
+	var response *http.Response
+	for attempt := range maxRetries {
+		req, err := newBrowserRequest(http.MethodGet, urlStr)
+		if err != nil {
+			return meta, err
+		}
+		response, err = client.Do(req)
+		if err != nil {
+			return meta, err
+		}
+		if !isRetryableStatus(response.StatusCode) || attempt == maxRetries-1 {
+			break
+		}
+		response.Body.Close()
+		// Exponential backoff with jitter: 500ms, 1s, 2s base + random jitter
+		backoff := time.Duration(1<<uint(attempt)) * 500 * time.Millisecond
+		jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
+		logrus.Warnf("Metadata fetch got %s, retrying (%d/%d)...", response.Status, attempt+1, maxRetries)
+		time.Sleep(backoff + jitter)
 	}
 	defer response.Body.Close()
 
@@ -160,51 +266,58 @@ func GetMetaDataFromURL(urlStr string) (meta Metadata, err error) {
 			meta.Image = baseURL.ResolveReference(imgURL).String()
 		}
 
-		// Download the image
-		imgResponse, err := client.Get(meta.Image)
+		// Download the image with browser-like headers (override Accept for image content)
+		imgReq, err := newBrowserRequest(http.MethodGet, meta.Image)
 		if err != nil {
-			logrus.Warnf("Failed to download image: %v", err)
+			logrus.Warnf("Failed to create image request: %v", err)
 		} else {
-			defer imgResponse.Body.Close()
-
-			if imgResponse.StatusCode != http.StatusOK {
-				logrus.Warnf("Image download failed with status: %s", imgResponse.Status)
+			imgReq.Header.Set("Accept", "image/avif,image/webp,image/png,image/jpeg,*/*;q=0.8")
+			imgResponse, err := client.Do(imgReq)
+			if err != nil {
+				logrus.Warnf("Failed to download image: %v", err)
 			} else {
-				// Check content type
-				contentType := imgResponse.Header.Get("Content-Type")
-				if !strings.HasPrefix(contentType, "image/") {
-					logrus.Warnf("URL returned non-image content type: %s", contentType)
+				defer imgResponse.Body.Close()
+
+				if imgResponse.StatusCode != http.StatusOK {
+					logrus.Warnf("Image download failed with status: %s", imgResponse.Status)
 				} else {
-					// Read image data with size limit
-					imageData, err := io.ReadAll(io.LimitReader(imgResponse.Body, int64(config.WhatsappSettingMaxImageSize)))
-					if err != nil {
-						logrus.Warnf("Failed to read image data: %v", err)
-					} else if len(imageData) == 0 {
-						logrus.Warn("Downloaded image data is empty")
+					// Check content type
+					contentType := imgResponse.Header.Get("Content-Type")
+					if !strings.HasPrefix(contentType, "image/") {
+						logrus.Warnf("URL returned non-image content type: %s", contentType)
 					} else {
-						meta.ImageThumb = imageData
-
-						// Validate image by decoding it
-						imageReader := bytes.NewReader(imageData)
-						img, _, err := image.Decode(imageReader)
+						// Read image data with strict size enforcement
+						maxImageSize := int64(config.WhatsappSettingMaxImageSize)
+						limit := maxImageSize
+						if limit < math.MaxInt64 {
+							limit++
+						}
+						imageData, err := io.ReadAll(&io.LimitedReader{R: imgResponse.Body, N: limit})
 						if err != nil {
-							logrus.Warnf("Failed to decode image: %v", err)
+							logrus.Warnf("Failed to read image data: %v", err)
+						} else if len(imageData) == 0 {
+							logrus.Warn("Downloaded image data is empty")
+						} else if int64(len(imageData)) > maxImageSize {
+							logrus.Warnf("Downloaded image exceeds max size: %d > %d", len(imageData), maxImageSize)
 						} else {
-							bounds := img.Bounds()
-							width := uint32(bounds.Max.X - bounds.Min.X)
-							height := uint32(bounds.Max.Y - bounds.Min.Y)
-
-							// Check if image is square (1:1 ratio)
-							if width == height && width <= 200 {
-								// For small square images, leave width and height as nil
-								meta.Width = nil
-								meta.Height = nil
+							// Validate image by decoding it
+							imageReader := bytes.NewReader(imageData)
+							img, _, err := image.Decode(imageReader)
+							if err != nil {
+								logrus.Warnf("Failed to decode image: %v", err)
 							} else {
-								meta.Width = &width
-								meta.Height = &height
-							}
+								imageThumb, jpegThumb, width, height, prepErr := buildLinkPreviewThumbnails(img)
+								if prepErr != nil {
+									logrus.Warnf("Failed to prepare link preview thumbnail: %v", prepErr)
+								} else {
+									meta.ImageThumb = imageThumb
+									meta.JPEGThumb = jpegThumb
+									meta.Width = &width
+									meta.Height = &height
 
-							logrus.Debugf("Image dimensions: %dx%d", width, height)
+									logrus.Debugf("Image dimensions: %dx%d", width, height)
+								}
+							}
 						}
 					}
 				}
@@ -246,6 +359,11 @@ func DownloadImageFromURL(url string) ([]byte, string, error) {
 		return nil, "", err
 	}
 	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("HTTP request failed with status: %s", response.Status)
+	}
+
 	contentType := response.Header.Get("Content-Type")
 	if !strings.HasPrefix(contentType, "image/") {
 		return nil, "", fmt.Errorf("invalid content type: %s", contentType)
@@ -276,4 +394,268 @@ func DownloadImageFromURL(url string) ([]byte, string, error) {
 		return nil, "", err
 	}
 	return imageData, fileName, nil
+}
+
+// DownloadAudioFromURL downloads an audio file from the provided URL and returns the bytes and sanitized filename.
+// It validates that the content-type returned by the server starts with "audio/" and that the size is below
+// WhatsappSettingMaxDownloadSize limit to avoid memory exhaustion. Only the MIME types defined in audio validation
+// are allowed to ensure WhatsApp compatibility.
+func DownloadAudioFromURL(audioURL string) ([]byte, string, error) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+
+	resp, err := client.Get(audioURL)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("HTTP request failed with status: %s", resp.Status)
+	}
+
+	// Extract only the MIME type portion (ignore parameters like charset)
+	contentType := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+
+	// Align audio MIME validation with the one used for uploaded files to ensure consistency with WhatsApp requirements.
+	allowedMimes := map[string]bool{
+		"audio/aac":          true,
+		"audio/amr":          true,
+		"audio/flac":         true,
+		"audio/m4a":          true,
+		"audio/m4r":          true,
+		"audio/mp3":          true,
+		"audio/mpeg":         true,
+		"audio/ogg":          true,
+		"audio/wma":          true,
+		"audio/x-ms-wma":     true,
+		"audio/wav":          true,
+		"audio/vnd.wav":      true,
+		"audio/vnd.wave":     true,
+		"audio/wave":         true,
+		"audio/x-pn-wav":     true,
+		"audio/x-wav":        true,
+		"video/mp4":          true, // Sometimes audio is served as mp4
+		"application/ogg":    true, // Ogg audio
+		"application/x-mpeg": true,
+		"audio/webm":         true, // WebM audio
+		"video/webm":         true, // WebM audio/video
+		"audio/mp4":          true,
+	}
+
+	// If content type is generic or not in list, just warn but allow download (let WhatsApp reject if invalid)
+	if !allowedMimes[contentType] {
+		logrus.Warnf("DownloadAudioFromURL: unexpected content type '%s', proceeding anyway", contentType)
+	}
+
+	// Validate content length when it is provided by the server.
+	maxSize := config.WhatsappSettingMaxDownloadSize
+	if resp.ContentLength > 0 && resp.ContentLength > maxSize {
+		return nil, "", fmt.Errorf("audio size %d exceeds maximum allowed size %d", resp.ContentLength, maxSize)
+	}
+
+	// Guard against servers that do not set Content-Length by reading at most (maxSize+1) bytes
+	// and erroring if the limit is exceeded.
+	limit := maxSize
+	if limit < math.MaxInt64 {
+		limit++
+	}
+
+	limitedReader := &io.LimitedReader{R: resp.Body, N: limit}
+	audioData, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return nil, "", err
+	}
+	if int64(len(audioData)) > maxSize {
+		return nil, "", fmt.Errorf("downloaded audio size of %d bytes exceeds the maximum allowed size of %d bytes", len(audioData), maxSize)
+	}
+
+	// Derive filename from URL path (strip query parameters if present)
+	segments := strings.Split(audioURL, "/")
+	fileName := segments[len(segments)-1]
+	fileName = strings.Split(fileName, "?")[0]
+	if fileName == "" {
+		fileName = fmt.Sprintf("audio_%d", time.Now().Unix())
+	}
+
+	return audioData, fileName, nil
+}
+
+// DownloadVideoFromURL downloads a video file from the provided URL and returns the bytes and sanitized filename.
+// It validates that the content-type returned by the server is one of the supported WhatsApp video formats and
+// that the size does not exceed WhatsappSettingMaxDownloadSize to avoid memory exhaustion.
+func DownloadVideoFromURL(videoURL string) ([]byte, string, error) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+
+	resp, err := client.Get(videoURL)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("HTTP request failed with status: %s", resp.Status)
+	}
+
+	// Extract MIME type without parameters
+	contentType := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+
+	allowedMimes := map[string]bool{
+		"video/mp4":        true,
+		"video/x-matroska": true, // mkv
+		"video/avi":        true,
+		"video/x-msvideo":  true,
+	}
+
+	if !allowedMimes[contentType] {
+		return nil, "", fmt.Errorf("invalid content type: %s", contentType)
+	}
+
+	// Validate content length if provided
+	maxSize := config.WhatsappSettingMaxDownloadSize
+	if resp.ContentLength > 0 && resp.ContentLength > maxSize {
+		return nil, "", fmt.Errorf("video size %d exceeds maximum allowed size %d", resp.ContentLength, maxSize)
+	}
+
+	// Guard against unknown Content-Length by limiting reader
+	limit := maxSize
+	if limit < math.MaxInt64 {
+		limit++
+	}
+
+	limitedReader := &io.LimitedReader{R: resp.Body, N: limit}
+	videoData, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return nil, "", err
+	}
+	if int64(len(videoData)) > maxSize {
+		return nil, "", fmt.Errorf("downloaded video size of %d bytes exceeds the maximum allowed size of %d bytes", len(videoData), maxSize)
+	}
+
+	// Derive filename from URL path
+	segments := strings.Split(videoURL, "/")
+	fileName := segments[len(segments)-1]
+	fileName = strings.Split(fileName, "?")[0]
+	if fileName == "" {
+		fileName = fmt.Sprintf("video_%d.mp4", time.Now().Unix())
+	}
+
+	return videoData, fileName, nil
+}
+
+// FormatBusinessHourTime converts numeric time format (e.g., 600, 1200) to HH:MM format (e.g., "06:00", "12:00")
+func FormatBusinessHourTime(timeValue any) string {
+	var timeInt int
+
+	switch v := timeValue.(type) {
+	case int:
+		timeInt = v
+	case int32:
+		timeInt = int(v)
+	case int64:
+		timeInt = int(v)
+	case uint:
+		timeInt = int(v)
+	case uint32:
+		timeInt = int(v)
+	case uint64:
+		timeInt = int(v)
+	case string:
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			return v // Return as-is if it's already a string and can't be parsed
+		}
+		timeInt = parsed
+	default:
+		return fmt.Sprintf("%v", timeValue) // Return as-is for unknown types
+	}
+
+	// Extract hours and minutes
+	hours := timeInt / 100
+	minutes := timeInt % 100
+
+	return fmt.Sprintf("%02d:%02d", hours, minutes)
+}
+
+// UniqueStrings removes duplicate strings from a slice while preserving order
+func UniqueStrings(input []string) []string {
+	seen := make(map[string]bool)
+	result := []string{}
+	for _, s := range input {
+		if !seen[s] {
+			seen[s] = true
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// DownloadFileFromURL downloads a file from the provided URL and returns the bytes and sanitized filename.
+// It enforces max file size limit.
+func DownloadFileFromURL(fileURL string) ([]byte, string, error) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+
+	resp, err := client.Get(fileURL)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("HTTP request failed with status: %s", resp.Status)
+	}
+
+	// Validate content length when it is provided by the server.
+	maxSize := config.WhatsappSettingMaxFileSize
+	if resp.ContentLength > 0 && resp.ContentLength > maxSize {
+		return nil, "", fmt.Errorf("file size %d exceeds maximum allowed size %d", resp.ContentLength, maxSize)
+	}
+
+	// Limit reader
+	limit := maxSize
+	if limit < math.MaxInt64 {
+		limit++
+	}
+
+	limitedReader := &io.LimitedReader{R: resp.Body, N: limit}
+	fileData, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return nil, "", err
+	}
+	if int64(len(fileData)) > maxSize {
+		return nil, "", fmt.Errorf("downloaded file size of %d bytes exceeds the maximum allowed size of %d bytes", len(fileData), maxSize)
+	}
+
+	// Derive filename from URL path
+	segments := strings.Split(fileURL, "/")
+	fileName := segments[len(segments)-1]
+	fileName = strings.Split(fileName, "?")[0]
+	if fileName == "" {
+		fileName = fmt.Sprintf("file_%d", time.Now().Unix())
+	}
+
+	return fileData, fileName, nil
 }

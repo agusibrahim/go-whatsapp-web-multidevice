@@ -1,8 +1,8 @@
 package send
 
 type MessageRequest struct {
-	Phone          string  `json:"phone" form:"phone"`
-	Message        string  `json:"message" form:"message"`
-	IsForwarded    bool    `json:"is_forwarded" form:"is_forwarded"`
-	ReplyMessageID *string `json:"reply_message_id" form:"reply_message_id"`
+	BaseRequest
+	Message        string   `json:"message" form:"message"`
+	ReplyMessageID *string  `json:"reply_message_id" form:"reply_message_id"`
+	Mentions       []string `json:"mentions,omitempty" form:"mentions"` // List of phone numbers/JIDs to mention (ghost mentions)
 }

@@ -3,8 +3,9 @@ package send
 import "mime/multipart"
 
 type FileRequest struct {
-	Phone       string                `json:"phone" form:"phone"`
-	File        *multipart.FileHeader `json:"file" form:"file"`
-	Caption     string                `json:"caption" form:"caption"`
-	IsForwarded bool                  `json:"is_forwarded" form:"is_forwarded"`
+	BaseRequest
+	File           *multipart.FileHeader `json:"file" form:"file"`
+	FileURL        *string               `json:"file_url" form:"file_url"`
+	Caption        string                `json:"caption" form:"caption"`
+	ReplyMessageID *string               `json:"reply_message_id" form:"reply_message_id"`
 }
